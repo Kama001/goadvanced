@@ -18,6 +18,8 @@ var ErrMaxResources = errors.New("maximum number of resources reached")
 type pooledResource struct {
 	ioCloser io.Closer
 	lastUsed time.Time
+	useCount int
+	mu       sync.Mutex
 }
 
 // Pool manages a set of resources that can be shared.
@@ -31,6 +33,7 @@ type Pool struct {
 	healthCheck func(io.Closer) error // New: Function to check resource health
 	maxOpen     int                   // New: Max number of total resources
 	numOpen     int                   // New: Current number of total resources
+	maxUses     int                   // max number of times a resource can be used
 }
 type PoolStats struct {
 	NumOpen int
@@ -74,7 +77,8 @@ func New(factory func() (io.Closer, error),
 	size uint,
 	maxLifetime time.Duration,
 	maxOpen int,
-	healthCheck func(io.Closer) error) (*Pool, error) {
+	healthCheck func(io.Closer) error,
+	maxUses int) (*Pool, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("cannot create channel with size < 0")
 	}
@@ -84,6 +88,7 @@ func New(factory func() (io.Closer, error),
 		maxLifetime: maxLifetime,
 		healthCheck: healthCheck,
 		maxOpen:     maxOpen,
+		maxUses:     maxUses,
 	}
 	for i := uint(0); i < size; i++ {
 		res, err := p.NewResource()
@@ -120,6 +125,14 @@ func (p *Pool) Get(ctx context.Context) (io.Closer, error) {
 				p.dec()
 				continue
 			}
+			res.mu.Lock()
+			res.useCount++
+			res.mu.Unlock()
+			if res.useCount > p.maxUses {
+				res.ioCloser.Close()
+				p.dec()
+				continue
+			}
 			return res.ioCloser, nil
 		default:
 			fmt.Println("resource is not available, trying to create new one")
@@ -133,6 +146,9 @@ func (p *Pool) Get(ctx context.Context) (io.Closer, error) {
 			}
 			p.resources <- res
 			p.inc()
+			res.mu.Lock()
+			res.useCount++
+			res.mu.Unlock()
 			return res.ioCloser, nil
 		}
 		p.lock.Unlock()
@@ -153,6 +169,14 @@ func (p *Pool) Get(ctx context.Context) (io.Closer, error) {
 				p.dec()
 				continue
 			}
+			res.mu.Lock()
+			res.useCount++
+			res.mu.Unlock()
+			if res.useCount > p.maxUses {
+				res.ioCloser.Close()
+				p.dec()
+				continue
+			}
 			return res.ioCloser, nil
 		}
 	}
@@ -169,8 +193,8 @@ func (p *Pool) Put(resource io.Closer) {
 	}
 	p.lock.Unlock()
 	select {
-	case p.resources <- &pooledResource{resource, time.Now()}:
-		fmt.Println("successfully returned the resource")
+	case p.resources <- &pooledResource{ioCloser: resource, lastUsed: time.Now()}:
+		// fmt.Println("successfully returned the resource")
 	default:
 		fmt.Println("pool is full, closing the resource")
 		p.dec()
@@ -194,8 +218,38 @@ func (p *Pool) Len() int {
 	return len(p.resources)
 }
 
+type CloserFunc struct {
+}
+
+func (cf *CloserFunc) Close() error { return nil }
+
 // Example Usage (for your reference once you're done)
 func main() {
-	// This part is just to demonstrate how the pool would be used.
-	// You don't need to implement this.
+	var closer CloserFunc
+	factoryFunc := func() (io.Closer, error) { return &closer, nil }
+	healthcheckFunc := func(io.Closer) error { return nil }
+	pool, err := New(factoryFunc, 2, 5*time.Second, 5, healthcheckFunc, 3)
+	if err != nil {
+		fmt.Println("pool creation error")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for i := 0; i < 7; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			fmt.Printf("trying to get resource for Goroutine %d:\n", i)
+			res, err := pool.Get(ctx)
+			if err != nil {
+				fmt.Printf("cannot create the resource for go routine %d, %s\n", i, err)
+			}
+			fmt.Printf("Goroutine %d: Got resource\n", i)
+			time.Sleep(3 * time.Second)
+			pool.Put(res)
+			fmt.Printf("Goroutine %d: Put resource back\n", i)
+		}(i)
+	}
+	wg.Wait()
 }
