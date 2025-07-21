@@ -73,13 +73,16 @@ func (dbf *DBFactory) Destroy(dbc *DBConnection) error {
 }
 
 type Pool[T Resource] struct {
-	closed      bool
-	mu          sync.Mutex
-	resources   chan T
-	factory     Factory[T]
-	maxLifetime time.Duration
-	maxSize     int
-	curSize     int
+	closed         bool
+	mu             sync.Mutex
+	resources      chan T
+	factory        Factory[T]
+	maxLifetime    time.Duration
+	maxSize        int
+	curSize        int
+	idleTimeout    time.Duration
+	reaperInterval time.Duration
+	reaperChan     chan struct{}
 }
 
 func (p *Pool[T]) NewResource() (T, error) {
@@ -104,15 +107,17 @@ func (p *Pool[T]) decSize() {
 	p.mu.Unlock()
 }
 
-func New[T Resource](factory Factory[T], size int, maxLifetime time.Duration, maxSize int) (*Pool[T], error) {
+func New[T Resource](factory Factory[T], size int, maxLifetime time.Duration, maxSize int, reaperInt, idleTimeout time.Duration) (*Pool[T], error) {
 	if maxSize < size || size == 0 {
 		return nil, fmt.Errorf("invalid pool sizes")
 	}
 	p := &Pool[T]{
-		factory:     factory,
-		resources:   make(chan T, size),
-		maxLifetime: maxLifetime,
-		maxSize:     maxSize,
+		factory:        factory,
+		resources:      make(chan T, size),
+		maxLifetime:    maxLifetime,
+		maxSize:        maxSize,
+		reaperInterval: reaperInt,
+		idleTimeout:    idleTimeout,
 	}
 	for i := 0; i < size; i++ {
 		res, err := p.NewResource()
@@ -122,6 +127,7 @@ func New[T Resource](factory Factory[T], size int, maxLifetime time.Duration, ma
 		}
 		p.incSize(res)
 	}
+	go p.Reaper(p.reaperChan)
 	return p, nil
 }
 
@@ -203,22 +209,74 @@ func (p *Pool[T]) Shutdown() {
 	for res := range p.resources {
 		p.factory.Destroy(res)
 	}
+	p.reaperChan <- struct{}{}
 }
 
 func (p *Pool[T]) Len() int {
 	return len(p.resources)
 }
 
+func (p *Pool[T]) Reaper(reaperChan <-chan struct{}) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		fmt.Printf("pool closed while reaping idle resources\n")
+	}
+	p.mu.Unlock()
+	ticker := time.NewTicker(p.reaperInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-reaperChan:
+			fmt.Println("closing reaper")
+			return
+		case <-ticker.C:
+			var idleResources []T
+		drainLoop:
+			for {
+				select {
+				case res := <-p.resources:
+					idleResources = append(idleResources, res)
+				default:
+					break drainLoop
+				}
+			}
+			for _, res := range idleResources {
+				if time.Since(res.GetLastused()) > p.idleTimeout {
+					p.mu.Lock()
+					p.factory.Destroy(res)
+					p.curSize--
+					p.mu.Unlock()
+				} else {
+					p.resources <- res
+				}
+			}
+		}
+	}
+}
+
+func (p *Pool[T]) Do(ctx context.Context, fn func(conn T) error) error {
+	conn, err := p.Get(ctx)
+	if err != nil {
+		return err
+	}
+	defer p.Put(conn)
+	if err := fn(conn); err != nil {
+		return err
+	}
+	return nil
+}
+
 func main() {
 	dbFactory := &DBFactory{}
-	pool, err := New[*DBConnection](dbFactory, 2, 3*time.Second, 5)
+	pool, err := New[*DBConnection](dbFactory, 2, 3*time.Second, 5, 10*time.Second, 5*time.Second)
 	if err != nil {
 		fmt.Println(err)
 	}
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -229,7 +287,7 @@ func main() {
 				return
 			}
 			fmt.Printf("Goroutine %d: Got resource %d\n", i, res.GetID())
-			time.Sleep(4 * time.Second)
+			time.Sleep(2 * time.Second)
 			pool.Put(res)
 			fmt.Printf("Goroutine %d: Put resource %d back\n", i, res.GetID())
 		}(i)
