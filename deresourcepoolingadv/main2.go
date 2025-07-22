@@ -108,7 +108,7 @@ func (p *Pool[T]) decSize() {
 }
 
 func New[T Resource](factory Factory[T], size int, maxLifetime time.Duration, maxSize int, reaperInt, idleTimeout time.Duration) (*Pool[T], error) {
-	if maxSize < size || size == 0 {
+	if maxSize < size || size == 0 || maxSize < 0 {
 		return nil, fmt.Errorf("invalid pool sizes")
 	}
 	p := &Pool[T]{
@@ -185,6 +185,13 @@ func (p *Pool[T]) Get(ctx context.Context) (T, error) {
 }
 
 func (p *Pool[T]) Put(res T) string {
+	if res.IsNil() {
+		p.mu.Lock()
+		p.factory.Destroy(res)
+		p.curSize--
+		p.mu.Unlock()
+		return "nil resource received!!!"
+	}
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
